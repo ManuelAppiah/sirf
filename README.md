@@ -1,41 +1,86 @@
 # PDF to Excel Converter
 
-A comprehensive web application to extract tables from PDF files and convert them into Excel spreadsheets, preserving formatting and structure.
+A web-based tool to convert PDF documents into structured Excel spreadsheets with intelligent table extraction.
 
 ## Features
 
--   **Premium UI**: Glassmorphism design with smooth animations.
--   **Smart Extraction**: Uses `Tabula` (via `tabula-js`) for accurate table extraction.
--   **Instant Download**: Converts and provides a download link immediately.
--   **Secure**: Files are processed locally.
+- 📄 **Smart PDF Parsing**: Extracts tables and metadata from PDF documents
+- 📊 **Excel Generation**: Creates formatted Excel files matching the original PDF structure
+- 🎯 **SIRF Form Support**: Specialized extraction for Stock Issue Request Forms
+- 🎨 **Modern UI**: Clean, responsive interface with drag-and-drop upload
+- 🔄 **Multi-Column Detection**: Intelligently identifies and maps all table columns
 
-## Prerequisites
+## Supported Data
 
--   **Node.js**: v14 or higher.
--   **Java**: Required for the extraction engine (Tabula).
+**Metadata Fields:**
+- Site Name, Site ID
+- Project Code, Project Name
+- Request Date, Need by Date, Req. No.
+- Requesting Department, REG, Project Manager
 
-## Installation
+**Table Columns:**
+- S.No, MTN Item code
+- Item description, Type of Item
+- Qty requested, UOM
+- PO Number, OEM Part Number
+- OEM Serial Number, Qty Issued
 
-1.  Install dependencies:
-    ```bash
-    npm install
-    ```
+## Quick Start
 
-## Usage
+### Installation
 
-1.  Start the server:
-    ```bash
-    node server.js
-    ```
+```bash
+# Install dependencies
+npm install
 
-2.  Open your browser and navigate to:
-    ```
-    http://localhost:3000
-    ```
+# Start server
+npm start
+```
 
-3.  Drag and drop your PDF file to convert it.
+Access at: http://localhost:3000
 
-## Troubleshooting
+### Usage
 
--   **Extraction Failed**: Ensure Java is installed and in your system PATH (`java -version`).
--   **No Tables Found**: If the PDF contains image-based tables (scanned), this tool might not extract them. It works best with native text-based PDFs.
+1. Open the web interface
+2. Drag & drop or browse for your PDF file
+3. Click "Convert to Excel"
+4. Download the generated Excel file
+
+## Deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed deployment instructions for:
+- Vercel
+- Render
+- Railway
+- VPS/Cloud Servers
+
+## File Structure
+
+```
+Pdf-excel/
+├── server.js           # Express server & extraction logic
+├── package.json        # Dependencies
+├── static/
+│   ├── css/style.css   # UI styling
+│   └── js/script.js    # Frontend logic
+├── templates/
+│   └── index.html      # Main page
+├── uploads/            # Temporary file storage
+└── DEPLOYMENT.md       # Deployment guide
+```
+
+## Technology Stack
+
+- **Backend**: Node.js, Express
+- **PDF Parsing**: pdf2json
+- **Excel Generation**: xlsx (SheetJS)
+- **File Upload**: Multer
+- **Frontend**: Vanilla HTML/CSS/JavaScript
+
+## License
+
+ISC
+
+## Support
+
+For issues or questions, please check the server logs and browser console for error details.

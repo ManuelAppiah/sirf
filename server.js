@@ -4,15 +4,25 @@ const path = require('path');
 const fs = require('fs');
 const XLSX = require('xlsx');
 const PDFParser = require("pdf2json");
-const PDFDocument = require('pdfkit');
 
 const app = express();
 const port = 3000;
 
+// CORS
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
+
 // Configure file uploads
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir);
+    fs.mkdirSync(uploadDir, { recursive: true });
 }
 
 const storage = multer.diskStorage({
@@ -36,8 +46,8 @@ const upload = multer({
     }
 });
 
-app.use(express.static('templates'));
-app.use('/static', express.static('static'));
+// Serve static files
+app.use('/static', express.static(path.join(__dirname, 'static')));
 
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'templates', 'index.html'));
@@ -79,7 +89,7 @@ function extractSmartData(pdfData) {
         allTexts = allTexts.concat(p.Texts);
     });
 
-    // Extract all metadata fields
+    // Extract all metadata fields (SIRF form specific)
     const metaData = {
         "Request Date": findValue(allTexts, /Request\s*Date/i, { rightOnly: true }),
         "Need by Date": findValue(allTexts, /Need\s*by\s*Date/i, { rightOnly: true }),
@@ -93,47 +103,54 @@ function extractSmartData(pdfData) {
         "Project Mgr": findValue(allTexts, /Project\s*Mgr/i, { rightOnly: true })
     };
 
-    const tableRows = [];
-
-    // Define ALL table columns based on the SIRF form
-    const definedColumns = [
-        { id: 'sno', pattern: /S\.?\s*No/i, x: -1 },
-        { id: 'mtncode', pattern: /MTN\s*(Item\s*)?code/i, x: -1 },
-        { id: 'desc', pattern: /Item\s*description/i, x: -1 },
-        { id: 'type', pattern: /Type\s*of\s*Item/i, x: -1 },
-        { id: 'qty', pattern: /(Qty\s*)?requested/i, x: -1 },
-        { id: 'uom', pattern: /UOM/i, x: -1 },
-        { id: 'po', pattern: /PO\s*Number/i, x: -1 },
-        { id: 'oem', pattern: /OEM\s*Part\s*Number/i, x: -1 },
-        { id: 'oemserial', pattern: /OEM\s*Serial/i, x: -1, optional: true },
-        { id: 'issued', pattern: /Qty\s*Issued/i, x: -1, optional: true }
-    ];
-
+    // DYNAMIC TABLE EXTRACTION - Find ALL columns automatically
+    let tableHeaders = [];
     let tableHeaderY = -1;
+    let headerRow = null;
 
-    // Find Header Positions (scan first page primarily)
+    // Strategy: Look for the first row that looks like headers
+    // Common header indicators: contains words like "code", "description", "qty", "item", "number", etc.
+    // Or has multiple items on same Y-level with similar formatting
+
     const firstPageTexts = pdfData.Pages.length > 0 ? pdfData.Pages[0].Texts : [];
 
+    // Group texts by Y position to find rows
+    const rowMap = new Map();
     firstPageTexts.forEach(t => {
-        const str = decodeURIComponent(t.R[0].T);
-        definedColumns.forEach(col => {
-            if (col.pattern.test(str)) {
-                if (col.x === -1) {
-                    col.x = t.x;
-                    // Use "MTN code" or "Item description" as anchor for table start Y
-                    if (col.id === 'mtncode' || col.id === 'desc') {
-                        tableHeaderY = t.y;
-                    }
-                }
-            }
-        });
+        const yKey = Math.round(t.y * 2) / 2; // Round to 0.5 precision
+        if (!rowMap.has(yKey)) rowMap.set(yKey, []);
+        rowMap.get(yKey).push(t);
     });
 
-    // Sort columns by X position to create intervals
-    const activeColumns = definedColumns.filter(c => c.x !== -1).sort((a, b) => a.x - b.x);
+    // Find the header row - look for a row with multiple items that looks like headers
+    for (const [y, texts] of rowMap.entries()) {
+        if (texts.length >= 3) { // At least 3 columns
+            // Sort by X position
+            texts.sort((a, b) => a.x - b.x);
 
-    // If we found at least 3 columns, we can form a table
-    if (activeColumns.length >= 3) {
+            // Check if this looks like a header row
+            const rowText = texts.map(t => decodeURIComponent(t.R[0].T)).join(' ').toLowerCase();
+            const headerKeywords = ['code', 'description', 'qty', 'quantity', 'item', 'number', 'uom', 'type', 'requested', 'name', 's.no', 'sno'];
+
+            const matchCount = headerKeywords.filter(kw => rowText.includes(kw)).length;
+
+            if (matchCount >= 2) { // Found likely header row
+                tableHeaderY = y;
+                headerRow = texts;
+                // Extract header names and positions
+                tableHeaders = texts.map(t => ({
+                    name: decodeURIComponent(t.R[0].T),
+                    x: t.x
+                }));
+                break;
+            }
+        }
+    }
+
+    const tableRows = [];
+
+    // If we found headers, extract data using column positions
+    if (tableHeaders.length > 0) {
 
         pdfData.Pages.forEach(page => {
             // Determine start Y for data rows
@@ -152,39 +169,50 @@ function extractSmartData(pdfData) {
             const processRow = (items) => {
                 if (items.length === 0) return;
 
-                const rowObj = {};
+                const rowData = {};
                 // Initialize all columns
-                definedColumns.forEach(c => rowObj[c.id] = "");
+                tableHeaders.forEach(h => rowData[h.name] = "");
 
                 items.forEach(item => {
                     const x = item.x;
                     const val = decodeURIComponent(item.R[0].T);
 
-                    // Map to column intervals
-                    let bestColId = null;
+                    // Find which column this belongs to based on X position
+                    let bestHeaderIdx = -1;
+                    let minDist = 1000;
 
-                    for (let i = 0; i < activeColumns.length; i++) {
-                        const col = activeColumns[i];
-                        const nextCol = activeColumns[i + 1];
+                    for (let i = 0; i < tableHeaders.length; i++) {
+                        const header = tableHeaders[i];
+                        const nextHeader = tableHeaders[i + 1];
 
-                        const start = col.x - 2.0;
-                        const end = nextCol ? (nextCol.x - 2.0) : 1000;
+                        // Check if X is within this column's range
+                        const colStart = header.x - 2.0;
+                        const colEnd = nextHeader ? (nextHeader.x - 2.0) : 1000;
 
-                        if (x >= start && x < end) {
-                            bestColId = col.id;
+                        if (x >= colStart && x < colEnd) {
+                            bestHeaderIdx = i;
                             break;
+                        }
+
+                        // Also track closest header as fallback
+                        const dist = Math.abs(x - header.x);
+                        if (dist < minDist) {
+                            minDist = dist;
+                            bestHeaderIdx = i;
                         }
                     }
 
-                    if (bestColId) {
-                        if (rowObj[bestColId]) rowObj[bestColId] += " " + val;
-                        else rowObj[bestColId] = val;
+                    if (bestHeaderIdx !== -1) {
+                        const headerName = tableHeaders[bestHeaderIdx].name;
+                        if (rowData[headerName]) rowData[headerName] += " " + val;
+                        else rowData[headerName] = val;
                     }
                 });
 
-                // Validate: Must have MTN code or description
-                if (rowObj.mtncode || rowObj.desc) {
-                    tableRows.push(rowObj);
+                // Validate: Must have at least one non-empty column
+                const hasData = Object.values(rowData).some(v => v.trim() !== "");
+                if (hasData) {
+                    tableRows.push(rowData);
                 }
             };
 
@@ -201,7 +229,11 @@ function extractSmartData(pdfData) {
         });
     }
 
-    return { meta: metaData, rows: tableRows };
+    return {
+        meta: metaData,
+        rows: tableRows,
+        headers: tableHeaders.map(h => h.name) // Return detected headers
+    };
 }
 
 app.post('/convert', upload.single('file'), async (req, res) => {
@@ -256,49 +288,44 @@ app.post('/convert', upload.single('file'), async (req, res) => {
             ], { origin: "A5" });
 
             // Row 6: Empty spacer
-            // Row 7: Department headers (optional, can skip)
-            XLSX.utils.sheet_add_aoa(ws, [
-                ["", "", "", "", "User Department", "", "", "", "Warehouse Department", ""]
-            ], { origin: "A7" });
 
-            // Row 8: Table Headers
-            XLSX.utils.sheet_add_aoa(ws, [
-                ["S.No", "MTN Item code", "Item description", "Type of Item", "Qty requested", "UOM", "PO Number", "OEM Part Number", "OEM Serial Number", "Qty Issued"]
-            ], { origin: "A8" });
+            // Row 7: Department headers (if needed - skip for now as we don't know the column count)
 
-            // Row 9+: Table Data
-            const tableRows = data.rows.map(r => [
-                r.sno,
-                r.mtncode,
-                r.desc,
-                r.type,
-                r.qty,
-                r.uom,
-                r.po,
-                r.oem,
-                r.oemserial || "",
-                r.issued || ""
-            ]);
-            XLSX.utils.sheet_add_aoa(ws, tableRows, { origin: "A9" });
+            // Row 8: DYNAMIC Table Headers (use detected headers)
+            if (data.headers && data.headers.length > 0) {
+                XLSX.utils.sheet_add_aoa(ws, [data.headers], { origin: "A8" });
 
-            // Column Widths
-            ws['!cols'] = [
-                { wch: 6 },   // A: S.No
-                { wch: 12 },  // B: MTN Code
-                { wch: 45 },  // C: Description
-                { wch: 12 },  // D: Type
-                { wch: 10 },  // E: Qty
-                { wch: 8 },   // F: UOM
-                { wch: 10 },  // G: PO Number
-                { wch: 15 },  // H: OEM Part
-                { wch: 15 },  // I: OEM Serial
-                { wch: 10 }   // J: Qty Issued
-            ];
+                // Row 9+: Table Data (dynamically map to headers)
+                const tableRows = data.rows.map(rowData => {
+                    return data.headers.map(header => rowData[header] || "");
+                });
+                XLSX.utils.sheet_add_aoa(ws, tableRows, { origin: "A9" });
+
+                // Column Widths - Dynamic based on content
+                const colWidths = data.headers.map((header, idx) => {
+                    // Calculate max width for this column
+                    let maxWidth = header.length;
+
+                    data.rows.forEach(row => {
+                        const cellValue = row[header] || "";
+                        if (cellValue.length > maxWidth) {
+                            maxWidth = cellValue.length;
+                        }
+                    });
+
+                    // Limit width: min 8, max 50 characters
+                    return { wch: Math.min(Math.max(maxWidth + 2, 8), 50) };
+                });
+
+                ws['!cols'] = colWidths;
+            } else {
+                // Fallback if no headers detected
+                XLSX.utils.sheet_add_aoa(ws, [
+                    ["No table detected - please check PDF structure"]
+                ], { origin: "A8" });
+            }
 
             XLSX.utils.book_append_sheet(wb, ws, "SIRF");
-
-            XLSX.writeFile(wb, outputPath);
-            res.json({ success: true, download_url: `/download/${outputFilename}` });
 
             // ---------------------------------------------------------
             // STRATEGY B: Visual Layout (Projection Profile Grid) - Kept for completeness
@@ -317,14 +344,10 @@ app.post('/convert', upload.single('file'), async (req, res) => {
                 if (rawTexts.length === 0) return;
 
                 // 2. Determine Column Boundaries using X-Projection
-                // We create a histogram/occupancy array for the width of the page
-                // PDF width is usually around 0-40 (for pdf2json units, roughly 1 unit ~ 10-20px?)
-                // Let's assume max width is around 100 units for safety.
                 const maxX = Math.ceil(Math.max(...rawTexts.map(t => t.x + t.w)) + 2);
-                const resolution = 10; // steps per unit. Higher = finer precision
+                const resolution = 10;
                 const occupancy = new Int8Array(maxX * resolution).fill(0);
 
-                // Fill occupancy
                 rawTexts.forEach(t => {
                     const start = Math.floor(t.x * resolution);
                     const end = Math.floor((t.x + t.w) * resolution);
@@ -333,34 +356,22 @@ app.post('/convert', upload.single('file'), async (req, res) => {
                     }
                 });
 
-                // Find gaps (sequences of 0s)
-                // We ignore small gaps (less than e.g. 1.0 unit) to avoid splitting words
-                const columns = []; // Store { start, end } of columns
+                const columns = [];
                 let inBlock = false;
-                let blockStart = 0;
-
-                // Threshold for a gap to be considered a column separator 
-                // (e.g., 2 units of whitespace)
                 const GAP_THRESHOLD = 2.0 * resolution;
-
                 let gapCounter = 0;
                 let colStart = -1;
 
                 for (let i = 0; i < occupancy.length; i++) {
                     if (occupancy[i] === 1) {
                         if (!inBlock) {
-                            // potential start of a column block
-                            // if we had a large gap, the previous block ended effectively
                             colStart = i;
                             inBlock = true;
                         }
                         gapCounter = 0;
                     } else {
-                        // Whitespace
                         gapCounter++;
                         if (inBlock && gapCounter > GAP_THRESHOLD) {
-                            // We found a splitter. The column ended before this gap.
-                            // The end of the column was roughly (i - gapCounter)
                             columns.push({
                                 start: colStart / resolution,
                                 end: (i - gapCounter) / resolution
@@ -369,7 +380,6 @@ app.post('/convert', upload.single('file'), async (req, res) => {
                         }
                     }
                 }
-                // Close last block
                 if (inBlock) {
                     columns.push({
                         start: colStart / resolution,
@@ -378,7 +388,6 @@ app.post('/convert', upload.single('file'), async (req, res) => {
                 }
 
                 // 3. Map Rows
-                // Sort by Y
                 rawTexts.sort((a, b) => a.y - b.y);
                 const rows = [];
                 let currentRowY = -1;
@@ -394,31 +403,20 @@ app.post('/convert', upload.single('file'), async (req, res) => {
                 if (currentRowItems.length > 0) rows.push({ y: currentRowY, items: currentRowItems });
 
                 // 4. Create Grid
-                /* 
-                   If no columns found (e.g. single block of text), fallback to standard lines.
-                   Otherwise, map items to the detected column buckets.
-                */
-
                 let finalDataB = [];
 
                 if (columns.length === 0) {
-                    // Fallback: Just lines
                     finalDataB = rows.map(r => [r.items.map(i => i.text).join(" ")]);
                 } else {
                     finalDataB = rows.map(row => {
                         const rowArr = new Array(columns.length).fill("");
-
                         row.items.forEach(item => {
-                            // Find best fitting column
-                            // An item belongs to a column if it overlaps significantly
                             let bestCol = -1;
                             let maxOverlap = 0;
-
                             const itemStart = item.x;
                             const itemEnd = item.x + item.w;
 
                             columns.forEach((col, idx) => {
-                                // Overlap calculation
                                 const overlapStart = Math.max(itemStart, col.start);
                                 const overlapEnd = Math.min(itemEnd, col.end);
                                 if (overlapEnd > overlapStart) {
@@ -430,7 +428,6 @@ app.post('/convert', upload.single('file'), async (req, res) => {
                                 }
                             });
 
-                            // Fallback: closest start
                             if (bestCol === -1) {
                                 let minDiff = 1000;
                                 columns.forEach((col, idx) => {
@@ -452,8 +449,6 @@ app.post('/convert', upload.single('file'), async (req, res) => {
 
                 if (finalDataB.length > 0) {
                     const wsB = XLSX.utils.aoa_to_sheet(finalDataB);
-
-                    // Calculate column widths
                     const colWidths = (finalDataB[0] || []).map((_, i) => ({ wch: 10 }));
                     finalDataB.slice(0, 50).forEach(row => {
                         row.forEach((cell, i) => {
@@ -464,10 +459,7 @@ app.post('/convert', upload.single('file'), async (req, res) => {
                     });
                     wsB['!cols'] = colWidths;
 
-                    // Apply table formatting with borders
                     const range = XLSX.utils.decode_range(wsB['!ref']);
-
-                    // Define border style
                     const borderStyle = {
                         top: { style: 'thin', color: { rgb: 'D3D3D3' } },
                         bottom: { style: 'thin', color: { rgb: 'D3D3D3' } },
@@ -475,50 +467,28 @@ app.post('/convert', upload.single('file'), async (req, res) => {
                         right: { style: 'thin', color: { rgb: 'D3D3D3' } }
                     };
 
-                    // Apply borders and styling to all cells
                     for (let R = range.s.r; R <= range.e.r; R++) {
                         for (let C = range.s.c; C <= range.e.c; C++) {
                             const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
                             if (!wsB[cellAddress]) continue;
-
-                            // Initialize cell style
                             if (!wsB[cellAddress].s) wsB[cellAddress].s = {};
-
-                            // Apply borders to all cells
                             wsB[cellAddress].s.border = borderStyle;
 
-                            // Style first row as header
                             if (R === 0) {
                                 wsB[cellAddress].s.font = { bold: true, color: { rgb: 'FFFFFF' } };
-                                wsB[cellAddress].s.fill = {
-                                    fgColor: { rgb: '4472C4' },
-                                    patternType: 'solid'
-                                };
-                                wsB[cellAddress].s.alignment = {
-                                    vertical: 'center',
-                                    horizontal: 'center'
-                                };
+                                wsB[cellAddress].s.fill = { fgColor: { rgb: '4472C4' }, patternType: 'solid' };
+                                wsB[cellAddress].s.alignment = { vertical: 'center', horizontal: 'center' };
                             } else {
-                                // Data rows - center align
-                                wsB[cellAddress].s.alignment = {
-                                    vertical: 'top',
-                                    horizontal: 'left',
-                                    wrapText: true
-                                };
+                                wsB[cellAddress].s.alignment = { vertical: 'top', horizontal: 'left', wrapText: true };
                             }
                         }
                     }
-
                     XLSX.utils.book_append_sheet(wb, wsB, `Original Page ${pageIndex + 1}`);
                 }
             });
 
             XLSX.writeFile(wb, outputPath);
-
-            res.json({
-                success: true,
-                download_url: `/download/${outputFilename}`
-            });
+            res.json({ success: true, download_url: `/download/${outputFilename}` });
 
         } catch (e) {
             console.error("Conversion Logic Error:", e);

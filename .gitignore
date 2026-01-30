@@ -1,0 +1,15 @@
+node_modules/
+uploads/*.pdf
+uploads/*.xlsx
+.env
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.gemini/
+.vercel
+.env*.local
